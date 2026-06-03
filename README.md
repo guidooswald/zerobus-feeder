@@ -18,7 +18,8 @@ Features:
 - Live terminal dashboard with throughput, latency percentiles, and a sparkline
   of recent latencies.
 - Selectable transport: streaming **gRPC** (JSON or Protobuf), the **REST** API
-  (Beta), or **Arrow Flight** (Beta) — see [Transports](#transports).
+  (Beta), **Arrow Flight** (Beta), or **OpenTelemetry / OTLP** (Beta) — see
+  [Transports](#transports).
 - OAuth2 client-credentials authentication — no PAT on disk.
 
 ## Prerequisites
@@ -143,11 +144,10 @@ python zerobus_feeder.py --config sample_config.yaml
 
 ## Transports
 
-The feeder can reach Zerobus three different ways, selected with `--transport`
-(or `transport:` in YAML). The probe/latency cycle, dashboard, and table-latency
-query work identically across all three — only the wire path changes, which
-makes this useful for comparing them head-to-head. For Databricks' own
-guidance on picking an interface, see
+The feeder can reach Zerobus four different ways, selected with `--transport`
+(or `transport:` in YAML). The probe/latency cycle and dashboard work across all
+of them — only the wire path changes, which makes this useful for comparing them
+head-to-head. For Databricks' own guidance on picking an interface, see
 [Choose an interface](https://docs.databricks.com/aws/en/ingestion/zerobus-ingest#choose-an-interface).
 
 | Transport | Wire | Serialization | Status | Needs |
@@ -155,6 +155,7 @@ guidance on picking an interface, see
 | `grpc` (default) | SDK streaming gRPC | JSON or Protobuf | GA | `databricks-zerobus-ingest-sdk` |
 | `rest` | HTTPS `POST` | JSON | Beta | `requests` (no SDK) |
 | `arrow` | Arrow Flight (gRPC) | Apache Arrow `RecordBatch` | Beta | `...-sdk[arrow]>=1.3.0` + `pyarrow` |
+| `otlp` | OTLP/gRPC | OpenTelemetry spans / logs / metrics | Beta | `opentelemetry-sdk` + OTLP gRPC exporter |
 
 ```bash
 # gRPC with Protobuf (descriptor built from the schema at runtime)
@@ -165,6 +166,11 @@ python zerobus_feeder.py --transport rest
 
 # Arrow Flight
 python zerobus_feeder.py --transport arrow
+
+# OpenTelemetry (OTLP) — table-name is the OTel table PREFIX
+python zerobus_feeder.py --transport otlp --create-table \
+  --table-name catalog.schema.myprefix --profile my-profile
+python zerobus_feeder.py --transport otlp --table-name catalog.schema.myprefix
 ```
 
 Notes:
@@ -182,9 +188,27 @@ Notes:
   It requires `databricks-zerobus-ingest-sdk[arrow]>=1.3.0`; `pip install -r
   requirements.txt` installs the right version. Delta `TIMESTAMP` maps to
   `timestamp('us', tz='UTC')` and `DATE` to `date32`.
+- **OTLP** (Beta) sends synthetic OpenTelemetry **spans, logs, and metrics** over
+  OTLP/gRPC, rotating across the three signals so all three OTel tables are
+  exercised. This is the odd one out:
+  - `--table-name` is a **prefix** (`catalog.schema.prefix`); the feeder writes to
+    `<prefix>_otel_spans`, `<prefix>_otel_logs`, and `<prefix>_otel_metrics`.
+  - The data-structure JSON does **not** apply — OTLP data follows the fixed
+    OTel v2 schema. `--create-table` creates the three predefined tables (with
+    `CLUSTER BY (time, service_name)` and `otel.schemaVersion=v2`) and grants.
+  - Each signal table gets its own OAuth token (per-table `authorization_details`)
+    and is addressed with the `x-databricks-zerobus-table-name` header.
+  - Authentication is the same client-credentials flow as REST. The SQL
+    table-latency panel is auto-disabled (the OTel schema has no `event_time`).
+  - Like REST, each export is a synchronous round-trip, so high `--eps` targets
+    are round-trip-bound. For production OpenTelemetry you'd typically point an
+    [OpenTelemetry Collector](https://docs.databricks.com/aws/en/ingestion/opentelemetry/configure)
+    at Zerobus and let it handle token refresh; this feeder talks to the
+    endpoint directly for latency comparison.
 
-Both Protobuf and Arrow derive their schema from the same data-structure JSON,
-so the target table must match it (use `--create-table` to keep them in sync).
+Protobuf and Arrow derive their schema from the same data-structure JSON, so the
+target table must match it (use `--create-table` to keep them in sync). OTLP uses
+its own fixed schema instead.
 
 ## Data structure JSON
 

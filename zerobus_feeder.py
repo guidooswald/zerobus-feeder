@@ -45,7 +45,7 @@ LOG_FILE = SCRIPT_DIR / "zerobus_feeder.log"
 DATABRICKS_CFG = Path.home() / ".databrickscfg"
 
 CLOUDS = ("aws", "azure", "gcp")
-TRANSPORTS = ("grpc", "rest", "arrow")
+TRANSPORTS = ("grpc", "rest", "arrow", "otlp")
 GRPC_FORMATS = ("json", "protobuf")
 SUPPORTED_TYPES = {
     "string", "int", "long", "float", "double",
@@ -174,6 +174,8 @@ class Config:
             return "REST (Beta, JSON)"
         if t == "arrow":
             return "Arrow Flight (Beta)"
+        if t == "otlp":
+            return "OTLP (Beta, spans/logs/metrics)"
         return t
 
 
@@ -1241,6 +1243,97 @@ def create_table(cfg: Config) -> None:
         _apply_zerobus_grants(w, warehouse_id, cfg.table_name, cfg.client_id)
 
 
+# Verbatim OpenTelemetry v2 table schemas (from the Databricks OTLP docs). The
+# {table} placeholder is the fully-qualified <catalog>.<schema>.<prefix>_otel_*
+# name. These require a Delta/warehouse that supports VARIANT shredding.
+_OTEL_TBLPROPERTIES = (
+    "TBLPROPERTIES (\n"
+    "  'otel.schemaVersion' = 'v2',\n"
+    "  'delta.checkpointPolicy' = 'classic',\n"
+    "  'delta.enableVariantShredding' = 'true',\n"
+    "  'delta.feature.variantShredding-preview' = 'supported',\n"
+    "  'delta.feature.variantType-preview' = 'supported')"
+)
+_OTEL_DDL = {
+    "spans": """CREATE TABLE IF NOT EXISTS {table} (
+  record_id STRING, time TIMESTAMP, date DATE, service_name STRING,
+  trace_id STRING, span_id STRING, trace_state STRING, parent_span_id STRING,
+  flags INT, name STRING, kind STRING,
+  start_time_unix_nano LONG, end_time_unix_nano LONG,
+  attributes VARIANT, dropped_attributes_count INT,
+  events ARRAY<STRUCT<time_unix_nano: LONG, name: STRING, attributes: VARIANT, dropped_attributes_count: INT>>,
+  dropped_events_count INT,
+  links ARRAY<STRUCT<trace_id: STRING, span_id: STRING, trace_state: STRING, attributes: VARIANT, dropped_attributes_count: INT, flags: INT>>,
+  dropped_links_count INT,
+  status STRUCT<message: STRING, code: STRING>,
+  resource STRUCT<attributes: VARIANT, dropped_attributes_count: INT>,
+  resource_schema_url STRING,
+  instrumentation_scope STRUCT<name: STRING, version: STRING, attributes: VARIANT, dropped_attributes_count: INT>,
+  span_schema_url STRING)
+USING DELTA
+CLUSTER BY (time, service_name, trace_id)
+""" + _OTEL_TBLPROPERTIES,
+    "logs": """CREATE TABLE IF NOT EXISTS {table} (
+  record_id STRING, time TIMESTAMP, date DATE, service_name STRING,
+  event_name STRING, trace_id STRING, span_id STRING,
+  time_unix_nano LONG, observed_time_unix_nano LONG,
+  severity_number STRING, severity_text STRING,
+  body VARIANT, attributes VARIANT, dropped_attributes_count INT, flags INT,
+  resource STRUCT<attributes: VARIANT, dropped_attributes_count: INT>,
+  resource_schema_url STRING,
+  instrumentation_scope STRUCT<name: STRING, version: STRING, attributes: VARIANT, dropped_attributes_count: INT>,
+  log_schema_url STRING)
+USING DELTA
+CLUSTER BY (time, service_name)
+""" + _OTEL_TBLPROPERTIES,
+    "metrics": """CREATE TABLE IF NOT EXISTS {table} (
+  record_id STRING, time TIMESTAMP, date DATE, service_name STRING,
+  start_time_unix_nano LONG, time_unix_nano LONG,
+  name STRING, description STRING, unit STRING, metric_type STRING,
+  gauge STRUCT<value: DOUBLE, exemplars: ARRAY<STRUCT<time_unix_nano: LONG, value: DOUBLE, span_id: STRING, trace_id: STRING, filtered_attributes: VARIANT>>, attributes: VARIANT, flags: INT>,
+  sum STRUCT<value: DOUBLE, exemplars: ARRAY<STRUCT<time_unix_nano: LONG, value: DOUBLE, span_id: STRING, trace_id: STRING, filtered_attributes: VARIANT>>, attributes: VARIANT, flags: INT, aggregation_temporality: STRING, is_monotonic: BOOLEAN>,
+  histogram STRUCT<count: LONG, sum: DOUBLE, bucket_counts: ARRAY<LONG>, explicit_bounds: ARRAY<DOUBLE>, exemplars: ARRAY<STRUCT<time_unix_nano: LONG, value: DOUBLE, span_id: STRING, trace_id: STRING, filtered_attributes: VARIANT>>, attributes: VARIANT, flags: INT, min: DOUBLE, max: DOUBLE, aggregation_temporality: STRING>,
+  exponential_histogram STRUCT<attributes: VARIANT, count: LONG, sum: DOUBLE, scale: INT, zero_count: LONG, positive_bucket: STRUCT<offset: INT, bucket_counts: ARRAY<LONG>>, negative_bucket: STRUCT<offset: INT, bucket_counts: ARRAY<LONG>>, flags: INT, exemplars: ARRAY<STRUCT<time_unix_nano: LONG, value: DOUBLE, span_id: STRING, trace_id: STRING, filtered_attributes: VARIANT>>, min: DOUBLE, max: DOUBLE, zero_threshold: DOUBLE, aggregation_temporality: STRING>,
+  summary STRUCT<count: LONG, sum: DOUBLE, quantile_values: ARRAY<STRUCT<quantile: DOUBLE, value: DOUBLE>>, attributes: VARIANT, flags: INT>,
+  metadata VARIANT,
+  resource STRUCT<attributes: VARIANT, dropped_attributes_count: INT>,
+  resource_schema_url STRING,
+  instrumentation_scope STRUCT<name: STRING, version: STRING, attributes: VARIANT, dropped_attributes_count: INT>,
+  metric_schema_url STRING)
+USING DELTA
+CLUSTER BY (time, service_name)
+""" + _OTEL_TBLPROPERTIES,
+}
+
+
+def create_otel_tables(cfg: Config) -> None:
+    """Create the three predefined OpenTelemetry v2 tables for the OTLP
+    transport (<prefix>_otel_spans/_logs/_metrics) and apply Zerobus grants.
+    For OTLP, cfg.table_name is the prefix (catalog.schema.prefix)."""
+    w = _workspace_client(cfg)
+    warehouse_id = cfg.warehouse_id or _pick_warehouse(w)
+    cfg.warehouse_id = warehouse_id
+    logger.info("using warehouse_id=%s", warehouse_id)
+
+    tables = otel_table_names(cfg.table_name)
+    # Validate the prefix parses and ensure the parent catalog/schema exist.
+    _ensure_catalog_and_schema(w, warehouse_id, tables["spans"])
+
+    for kind, table in tables.items():
+        ddl = _OTEL_DDL[kind].format(table=table)
+        say(f"[cyan]Creating OTel {kind} table[/cyan] {table}")
+        logger.info("OTel DDL (%s):\n%s", kind, ddl)
+        _execute_sql(w, warehouse_id, ddl)
+    say(f"[green]✓[/green] OTel tables ready: {', '.join(tables.values())}")
+
+    if cfg.client_id and Confirm.ask(
+        f"Grant USE CATALOG / USE SCHEMA / MODIFY / SELECT to {cfg.client_id} "
+        f"on all three OTel tables?", default=True,
+    ):
+        for table in tables.values():
+            _apply_zerobus_grants(w, warehouse_id, table, cfg.client_id)
+
+
 def _split_table_name(table_name: str) -> tuple[str, str, str]:
     parts = table_name.split(".")
     if len(parts) != 3:
@@ -1331,26 +1424,30 @@ def _apply_zerobus_grants(w, warehouse_id: str, table_name: str, principal: str)
     say("[green]✓[/green] Grants applied.")
 
 
-def _fixup_missing_grants(cfg: "Config") -> bool:
+def _fixup_missing_grants(cfg: "Config", table_name: Optional[str] = None) -> bool:
     """Interactively apply the grants Zerobus needs. Returns True if the
     grants were applied and the caller should retry the stream.
+
+    `table_name` defaults to cfg.table_name but can be overridden — the OTLP
+    transport writes to several derived tables, each needing its own grant.
     """
-    if not cfg.table_name or not cfg.client_id:
+    table_name = table_name or cfg.table_name
+    if not table_name or not cfg.client_id:
         return False
     try:
-        catalog, schema, _ = _split_table_name(cfg.table_name)
+        catalog, schema, _ = _split_table_name(table_name)
     except ValueError as e:
         say(f"[red]{e}[/red]", level=logging.ERROR)
         return False
 
     say(
         "\n[yellow]Zerobus rejected the service principal's authorizations.[/yellow]\n"
-        "The SP is missing explicit table-level grants. Required SQL:"
+        f"The SP is missing explicit table-level grants on {table_name}. Required SQL:"
     )
     grants_sql = (
         f"GRANT USE CATALOG ON CATALOG {catalog} TO `{cfg.client_id}`;\n"
         f"GRANT USE SCHEMA ON SCHEMA {catalog}.{schema} TO `{cfg.client_id}`;\n"
-        f"GRANT MODIFY, SELECT ON TABLE {cfg.table_name} TO `{cfg.client_id}`;"
+        f"GRANT MODIFY, SELECT ON TABLE {table_name} TO `{cfg.client_id}`;"
     )
     console.print(Panel(grants_sql, border_style="dim"))
 
@@ -1369,7 +1466,7 @@ def _fixup_missing_grants(cfg: "Config") -> bool:
         w = _workspace_client(cfg)
         warehouse_id = cfg.warehouse_id or _pick_warehouse(w)
         cfg.warehouse_id = warehouse_id
-        _apply_zerobus_grants(w, warehouse_id, cfg.table_name, cfg.client_id)
+        _apply_zerobus_grants(w, warehouse_id, table_name, cfg.client_id)
     except SystemExit:
         raise
     except Exception as e:
@@ -1519,14 +1616,17 @@ def _looks_like_auth_error(msg: str) -> bool:
     )
 
 
-def _open_with_grant_retry(cfg: "Config", opener):
+def _open_with_grant_retry(cfg: "Config", opener, table_name: Optional[str] = None):
     """Run `opener()`; if it fails with an authorization error, offer to apply
     the missing Zerobus table grants and retry once. Mirrors the original
-    inline create_stream behaviour so every transport benefits from it."""
+    inline create_stream behaviour so every transport benefits from it.
+
+    `table_name` overrides which table's grants are offered (OTLP uses several).
+    """
     try:
         return opener()
     except Exception as e:
-        if _looks_like_auth_error(str(e)) and _fixup_missing_grants(cfg):
+        if _looks_like_auth_error(str(e)) and _fixup_missing_grants(cfg, table_name):
             say("[cyan]Retrying after applying grants...[/cyan]")
             time.sleep(2)  # brief pause for grant propagation
             return opener()
@@ -1740,6 +1840,55 @@ class ArrowSender:
             self._stream.close()
 
 
+def _uc_authorization_details(table_name: str) -> str:
+    """RFC 9396 rich-authorization-request payload naming the exact Unity
+    Catalog privileges a Zerobus token must carry. Without this the token
+    endpoint mints a token with no authorization-details claims and the write
+    is rejected ("Missing authorization details in access token claims").
+    Shared by the REST and OTLP transports (both use bearer tokens)."""
+    catalog, schema, _ = _split_table_name(table_name)
+    return json.dumps([
+        {"type": "unity_catalog_privileges", "privileges": ["USE CATALOG"],
+         "object_type": "CATALOG", "object_full_path": catalog},
+        {"type": "unity_catalog_privileges", "privileges": ["USE SCHEMA"],
+         "object_type": "SCHEMA", "object_full_path": f"{catalog}.{schema}"},
+        {"type": "unity_catalog_privileges", "privileges": ["SELECT", "MODIFY"],
+         "object_type": "TABLE", "object_full_path": table_name},
+    ])
+
+
+def _request_zerobus_token(session, cfg: "Config", table_name: str):
+    """Client-credentials OAuth token scoped (via authorization_details) to
+    write `table_name` through the Zerobus direct-write API. Returns
+    (access_token, expires_in_seconds). Raises RuntimeError with the server's
+    error body on non-200 so auth failures are diagnosable."""
+    resource = (f"api://databricks/workspaces/"
+                f"{cfg.workspace_id}/zerobusDirectWriteApi")
+    url = cfg.oidc_token_url()
+    logger.info("Zerobus OAuth token request: url=%s table=%s client_id=%s",
+                url, table_name, cfg.client_id)
+    resp = session.post(
+        url,
+        auth=(cfg.client_id, cfg.client_secret),
+        data={
+            "grant_type": "client_credentials",
+            "scope": "all-apis",
+            "resource": resource,
+            # requests form-encodes this, matching curl --data-urlencode.
+            "authorization_details": _uc_authorization_details(table_name),
+        },
+        timeout=30,
+    )
+    if resp.status_code != 200:
+        logger.error("token endpoint HTTP %s  table=%s  body=%s",
+                     resp.status_code, table_name, resp.text[:500])
+        raise RuntimeError(
+            f"OAuth token request to {url} failed for {table_name}: "
+            f"HTTP {resp.status_code} — {resp.text[:300]}")
+    body = resp.json()
+    return body["access_token"], float(body.get("expires_in", 3600))
+
+
 class RestSender:
     """Zerobus REST API (Beta). Each send is a synchronous HTTPS POST of a
     one-element JSON array; the 200 response is the durable-write ack, so probe
@@ -1769,55 +1918,13 @@ class RestSender:
         _open_with_grant_retry(self.cfg, self._fetch_token)
         logger.info("REST transport ready: %s", self.cfg.rest_insert_url())
 
-    def _authorization_details(self) -> str:
-        """RFC 9396 rich-authorization-request payload naming the exact Unity
-        Catalog privileges the token must carry. Without this the Zerobus token
-        endpoint mints a token with no authorization-details claims and the
-        insert is rejected ("Missing authorization details in access token
-        claims")."""
-        catalog, schema, _ = _split_table_name(self.cfg.table_name)
-        return json.dumps([
-            {"type": "unity_catalog_privileges", "privileges": ["USE CATALOG"],
-             "object_type": "CATALOG", "object_full_path": catalog},
-            {"type": "unity_catalog_privileges", "privileges": ["USE SCHEMA"],
-             "object_type": "SCHEMA", "object_full_path": f"{catalog}.{schema}"},
-            {"type": "unity_catalog_privileges", "privileges": ["SELECT", "MODIFY"],
-             "object_type": "TABLE", "object_full_path": self.cfg.table_name},
-        ])
-
     def _fetch_token(self) -> None:
-        resource = (f"api://databricks/workspaces/"
-                    f"{self.cfg.workspace_id}/zerobusDirectWriteApi")
-        url = self.cfg.oidc_token_url()
-        logger.info("REST OAuth token request: url=%s resource=%s client_id=%s",
-                    url, resource, self.cfg.client_id)
-        resp = self._session.post(
-            url,
-            auth=(self.cfg.client_id, self.cfg.client_secret),
-            data={
-                "grant_type": "client_credentials",
-                "scope": "all-apis",
-                "resource": resource,
-                # requests form-encodes this value, matching curl's
-                # --data-urlencode "authorization_details=...".
-                "authorization_details": self._authorization_details(),
-            },
-            timeout=30,
-        )
-        if resp.status_code != 200:
-            # Surface the server's OAuth error body (error / error_description)
-            # — a bare "400 Bad Request" hides the actual reason.
-            logger.error("token endpoint HTTP %s  body=%s",
-                         resp.status_code, resp.text[:500])
-            raise RuntimeError(
-                f"OAuth token request to {url} failed: "
-                f"HTTP {resp.status_code} — {resp.text[:300]}\n"
-                f"(resource={resource})")
-        body = resp.json()
-        self._token = body["access_token"]
+        token, expires_in = _request_zerobus_token(
+            self._session, self.cfg, self.cfg.table_name)
+        self._token = token
         # Refresh a minute before the hour-long token actually expires.
-        self._token_expiry = time.time() + float(body.get("expires_in", 3600)) - 60
-        logger.info("REST OAuth token fetched (expires_in=%s)", body.get("expires_in"))
+        self._token_expiry = time.time() + expires_in - 60
+        logger.info("REST OAuth token fetched (expires_in=%s)", expires_in)
 
     def _ensure_token(self) -> None:
         if not self._token or time.time() >= self._token_expiry:
@@ -1862,12 +1969,236 @@ class RestSender:
             self._session.close()
 
 
+OTEL_SUFFIXES = {"spans": "_otel_spans", "logs": "_otel_logs", "metrics": "_otel_metrics"}
+_OTEL_SPAN_NAMES = ("http.request", "db.query", "cache.get", "rpc.call", "queue.publish")
+
+
+def otel_table_names(table_prefix: str) -> dict:
+    """For OTLP, `table_name` is a prefix (catalog.schema.prefix); the three
+    signal tables are <prefix>_otel_{spans,logs,metrics}."""
+    return {kind: f"{table_prefix}{suffix}" for kind, suffix in OTEL_SUFFIXES.items()}
+
+
+class OtlpSender:
+    """OpenTelemetry (OTLP) interface (Beta). Sends synthetic OTel signals
+    (spans, logs, metrics) over OTLP/gRPC to the Zerobus endpoint, rotating
+    across the three signal types so all three OTel tables are exercised.
+
+    Each signal table needs its own bearer token (the authorization_details
+    differ per table) and is addressed with the x-databricks-zerobus-table-name
+    metadata header. Like REST, each export is a synchronous round-trip, so
+    high --eps targets are round-trip-bound. The user's schema_file does not
+    apply — OTLP data follows the fixed OTel schema."""
+
+    SERVICE_NAME = "zerobus-feeder"
+
+    def __init__(self, cfg: "Config", generator: "DataGenerator"):
+        self.cfg = cfg
+        self.generator = generator
+        self.tables = otel_table_names(cfg.table_name)
+        self._session = None          # requests session for token fetches
+        self._sig = {}                # kind -> {token, expiry, exporter, table}
+        self._n = 0                   # round-robin counter across signal kinds
+        # Populated in open() once OTel is imported.
+        self._tracer = None
+        self._span_cap = None
+        self._logger = None
+        self._log_cap = None
+        self._SeverityNumber = None
+        self._grpc = None
+        self._exporters = {}          # kind -> exporter class
+
+    def open(self) -> None:
+        try:
+            import requests
+            import grpc
+            from opentelemetry.sdk.resources import Resource
+            from opentelemetry.sdk.trace import TracerProvider, SpanProcessor
+            from opentelemetry.sdk._logs import LoggerProvider, LogRecordProcessor
+            from opentelemetry._logs import SeverityNumber
+            from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+            from opentelemetry.exporter.otlp.proto.grpc._log_exporter import OTLPLogExporter
+            from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
+        except ImportError as e:
+            say("[red]OTLP transport needs the OpenTelemetry SDK + gRPC exporter.[/red]\n"
+                "[red]  pip install opentelemetry-sdk opentelemetry-exporter-otlp-proto-grpc[/red]\n"
+                f"[dim]({e})[/dim]", level=logging.ERROR)
+            raise SystemExit(1)
+
+        # The OTLP exporters log gRPC failures via the root logger; mute them so
+        # they don't scribble on the Rich dashboard. Failures are surfaced via
+        # the export() result instead.
+        logging.getLogger("opentelemetry").setLevel(logging.CRITICAL)
+
+        self._session = requests.Session()
+        self._grpc = grpc
+        self._SeverityNumber = SeverityNumber
+        self._exporters = {"spans": OTLPSpanExporter, "logs": OTLPLogExporter,
+                           "metrics": OTLPMetricExporter}
+        resource = Resource.create({"service.name": self.SERVICE_NAME})
+
+        # Span + log generation go through real providers with a capture
+        # processor, so we hand fully-formed Readable records to export().
+        class _SpanCapture(SpanProcessor):
+            def __init__(self): self.items = []
+            def on_start(self, span, parent_context=None): pass
+            def on_end(self, span): self.items.append(span)
+            def shutdown(self): pass
+            def force_flush(self, timeout_millis=None): return True
+
+        class _LogCapture(LogRecordProcessor):
+            def __init__(self): self.items = []
+            def on_emit(self, log_record): self.items.append(log_record)
+            def shutdown(self): pass
+            def force_flush(self, timeout_millis=None): return True
+
+        tp = TracerProvider(resource=resource)
+        self._span_cap = _SpanCapture()
+        tp.add_span_processor(self._span_cap)
+        self._tracer = tp.get_tracer(self.SERVICE_NAME, "1.0")
+
+        lp = LoggerProvider(resource=resource)
+        self._log_cap = _LogCapture()
+        lp.add_log_record_processor(self._log_cap)
+        self._logger = lp.get_logger(self.SERVICE_NAME, "1.0")
+
+        # Fetch a per-table token and build the matching exporter. Missing
+        # grants surface here (token endpoint) — reuse the grant-fixup retry.
+        for kind, table in self.tables.items():
+            self._sig[kind] = {"table": table, "token": "", "expiry": 0.0,
+                               "exporter": None}
+            _open_with_grant_retry(
+                self.cfg, lambda k=kind: self._refresh_signal(k), table_name=table)
+        logger.info("OTLP transport ready: endpoint=%s:443 tables=%s",
+                    self.cfg.zerobus_endpoint(), list(self.tables.values()))
+
+    def _refresh_signal(self, kind: str) -> None:
+        """(Re)fetch the token for one signal and (re)build its exporter."""
+        sig = self._sig[kind]
+        token, expires_in = _request_zerobus_token(
+            self._session, self.cfg, sig["table"])
+        sig["token"] = token
+        sig["expiry"] = time.time() + expires_in - 60
+        sig["exporter"] = self._exporters[kind](
+            endpoint=f"{self.cfg.zerobus_endpoint()}:443",
+            credentials=self._grpc.ssl_channel_credentials(),
+            headers={
+                "authorization": f"Bearer {token}",
+                "x-databricks-zerobus-table-name": sig["table"],
+            },
+            timeout=30,
+        )
+
+    def _exporter(self, kind: str):
+        sig = self._sig[kind]
+        if not sig["token"] or time.time() >= sig["expiry"]:
+            self._refresh_signal(kind)
+        return sig["exporter"]
+
+    # ---- synthetic signal builders -------------------------------------
+    def _build_span(self):
+        name = _OTEL_SPAN_NAMES[self._n % len(_OTEL_SPAN_NAMES)]
+        with self._tracer.start_as_current_span(name) as span:
+            span.set_attribute("feeder.seq", self._n)
+            span.set_attribute("http.status_code", random.choice([200, 200, 404, 500]))
+        return self._span_cap.items.pop()
+
+    def _build_log(self):
+        now = time.time_ns()
+        self._logger.emit(
+            timestamp=now, observed_timestamp=now,
+            severity_number=self._SeverityNumber.INFO, severity_text="INFO",
+            body=f"synthetic event {self._n}",
+            attributes={"feeder.seq": self._n, "kind": "synthetic"},
+        )
+        return self._log_cap.items.pop()
+
+    def _build_metric(self):
+        from opentelemetry.sdk.metrics.export import (
+            MetricsData, ResourceMetrics, ScopeMetrics, Metric, Gauge,
+            NumberDataPoint)
+        from opentelemetry.sdk.resources import Resource
+        from opentelemetry.sdk.util.instrumentation import InstrumentationScope
+        now = time.time_ns()
+        dp = NumberDataPoint(attributes={"feeder.seq": self._n},
+                             start_time_unix_nano=now, time_unix_nano=now,
+                             value=round(random.uniform(0, 100), 3))
+        metric = Metric(name="feeder.synthetic.gauge", description="synthetic gauge",
+                        unit="1", data=Gauge(data_points=[dp]))
+        sm = ScopeMetrics(scope=InstrumentationScope(self.SERVICE_NAME, "1.0"),
+                          metrics=[metric], schema_url="")
+        rm = ResourceMetrics(
+            resource=Resource.create({"service.name": self.SERVICE_NAME}),
+            scope_metrics=[sm], schema_url="")
+        return MetricsData(resource_metrics=[rm])
+
+    def _encode_size(self, kind: str, payload) -> int:
+        try:
+            if kind == "spans":
+                from opentelemetry.exporter.otlp.proto.common.trace_encoder import encode_spans
+                return len(encode_spans([payload]).SerializeToString())
+            if kind == "logs":
+                from opentelemetry.exporter.otlp.proto.common._log_encoder import encode_logs
+                return len(encode_logs([payload]).SerializeToString())
+            from opentelemetry.exporter.otlp.proto.common.metrics_encoder import encode_metrics
+            return len(encode_metrics(payload).SerializeToString())
+        except Exception:
+            return 0
+
+    def _send(self, kind: str) -> int:
+        """Build one signal of `kind`, export it synchronously, return bytes."""
+        if kind == "spans":
+            payload = self._build_span()
+            batch = [payload]
+        elif kind == "logs":
+            payload = self._build_log()
+            batch = [payload]
+        else:
+            payload = self._build_metric()
+            batch = payload  # metric exporter takes MetricsData directly
+        exporter = self._exporter(kind)
+        result = exporter.export(batch)
+        # All three export-result enums expose .name; SUCCESS is the happy path.
+        if getattr(result, "name", str(result)) != "SUCCESS":
+            raise RuntimeError(f"OTLP {kind} export returned {result} "
+                               f"(table {self._sig[kind]['table']})")
+        return self._encode_size(kind, payload)
+
+    def _next_kind(self) -> str:
+        kind = ("spans", "logs", "metrics")[self._n % 3]
+        self._n += 1
+        return kind
+
+    # probe and push both export synchronously (a round-trip); rotate signals.
+    def probe(self, record: dict) -> int:
+        return self._send(self._next_kind())
+
+    def push(self, record: dict) -> int:
+        return self._send(self._next_kind())
+
+    def flush(self) -> None:
+        pass
+
+    def close(self) -> None:
+        for sig in self._sig.values():
+            exp = sig.get("exporter")
+            if exp is not None:
+                try:
+                    exp.shutdown()
+                except Exception:
+                    pass
+        if self._session:
+            self._session.close()
+
+
 def make_sender(cfg: "Config", generator: "DataGenerator"):
     t = (cfg.transport or "grpc").lower()
     if t == "grpc":
         return GrpcSender(cfg, generator)
     if t == "rest":
         return RestSender(cfg, generator)
+    if t == "otlp":
+        return OtlpSender(cfg, generator)
     if t == "arrow":
         return ArrowSender(cfg, generator)
     raise ValueError(f"Unsupported transport: {cfg.transport!r} "
@@ -1936,7 +2267,11 @@ def run_feeder(cfg: Config) -> None:
     # Optional: SQL Statement client for the periodic table-latency query.
     # Runs after each probe batch, before resuming non-blocking sends.
     tl_client = None
-    if cfg.disable_table_latency:
+    if cfg.transport == "otlp":
+        # OTLP writes to fixed-schema OTel tables (time/service_name, no
+        # event_time) under a prefix, so the ingest-latency query can't run.
+        say("[dim]Table-latency query disabled (OTLP uses the OTel schema).[/dim]")
+    elif cfg.disable_table_latency:
         say("[dim]Table-latency query disabled (--no-table-latency).[/dim]")
     else:
         if cfg.profile:
@@ -2134,8 +2469,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--table-name", help="Full table name (catalog.schema.table)")
     p.add_argument("--transport", choices=TRANSPORTS,
                    help="How to reach Zerobus: grpc (SDK streaming, default), "
-                        "rest (REST API, Beta — JSON over HTTPS), or "
-                        "arrow (Arrow Flight, Beta — columnar RecordBatches)")
+                        "rest (REST API, Beta — JSON over HTTPS), "
+                        "arrow (Arrow Flight, Beta — columnar RecordBatches), or "
+                        "otlp (OpenTelemetry, Beta — spans/logs/metrics; "
+                        "table-name is the OTel table prefix)")
     p.add_argument("--record-format", choices=GRPC_FORMATS, dest="grpc_format",
                    help="Serialization for the gRPC transport: json (default) or "
                         "protobuf. Ignored for rest (always JSON) and arrow.")
@@ -2289,13 +2626,17 @@ def main() -> None:
         log_config(cfg, "config after --create-sp")
 
     if args.create_table:
-        if not cfg.schema_file:
-            say("[red]--create-table requires --schema-file.[/red]", level=logging.ERROR)
-            sys.exit(2)
         if not cfg.table_name:
             say("[red]--create-table requires --table-name.[/red]", level=logging.ERROR)
             sys.exit(2)
-        create_table(cfg)
+        if (cfg.transport or "grpc").lower() == "otlp":
+            # OTel tables use a fixed schema; table_name is the prefix.
+            create_otel_tables(cfg)
+        else:
+            if not cfg.schema_file:
+                say("[red]--create-table requires --schema-file.[/red]", level=logging.ERROR)
+                sys.exit(2)
+            create_table(cfg)
         save_last_values(cfg)
 
     missing = missing_required(cfg)

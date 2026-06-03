@@ -10,6 +10,11 @@ eps: 50
 #   rest  — Zerobus REST API (Beta): JSON records POSTed over HTTPS, no SDK
 #   arrow — Arrow Flight (Beta): columnar pyarrow RecordBatches over the SDK
 #           (needs databricks-zerobus-ingest-sdk[arrow]>=1.3.0)
+#   otlp  — OpenTelemetry (Beta): synthetic spans/logs/metrics over OTLP/gRPC.
+#           For otlp, table_name is the OTel table PREFIX (catalog.schema.prefix);
+#           the feeder writes to <prefix>_otel_spans / _logs / _metrics. The
+#           data-structure JSON does not apply. Use --create-table to create the
+#           three OTel tables. Needs opentelemetry-sdk + the OTLP gRPC exporter.
 transport: grpc
 
 # Record serialization for the gRPC transport only (CLI flag: --record-format):

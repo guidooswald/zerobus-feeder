@@ -6,3 +6,6 @@ rich>=13.0.0
 PyYAML>=6.0
 # Used by the REST transport (also pulled in transitively by databricks-sdk).
 requests>=2.28.0
+# Used by the OTLP transport (OpenTelemetry over gRPC).
+opentelemetry-sdk>=1.30.0
+opentelemetry-exporter-otlp-proto-grpc>=1.30.0
