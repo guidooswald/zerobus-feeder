@@ -45,6 +45,8 @@ LOG_FILE = SCRIPT_DIR / "zerobus_feeder.log"
 DATABRICKS_CFG = Path.home() / ".databrickscfg"
 
 CLOUDS = ("aws", "azure", "gcp")
+TRANSPORTS = ("grpc", "rest", "arrow")
+GRPC_FORMATS = ("json", "protobuf")
 SUPPORTED_TYPES = {
     "string", "int", "long", "float", "double",
     "boolean", "timestamp", "date", "binary",
@@ -134,6 +136,15 @@ class Config:
     warehouse_id: str = ""
     sp_display_name: str = "zerobus-feeder"
     disable_table_latency: bool = False
+    # How records reach Zerobus:
+    #   grpc  — the databricks-zerobus-ingest-sdk streaming gRPC connection (default)
+    #   rest  — the Zerobus REST API (Beta): HTTPS POST of JSON records, no SDK
+    #   arrow — Arrow Flight over the SDK (Beta): columnar pyarrow RecordBatches
+    transport: str = "grpc"
+    # Record serialization for the gRPC transport only (rest is always JSON,
+    # arrow is always Arrow). "json" needs no schema; "protobuf" builds a
+    # descriptor from the data-structure JSON at runtime.
+    grpc_format: str = "json"
 
     def zerobus_endpoint(self) -> str:
         cloud = (self.cloud or "").lower()
@@ -144,6 +155,26 @@ class Config:
         if cloud == "gcp":
             return f"{self.workspace_id}.zerobus.{self.region}.gcp.databricks.com"
         raise ValueError(f"Unsupported cloud: {self.cloud!r}")
+
+    def rest_insert_url(self) -> str:
+        """REST insert endpoint for the chosen table (Zerobus REST API, Beta)."""
+        return (f"https://{self.zerobus_endpoint()}"
+                f"/zerobus/v1/tables/{self.table_name}/insert")
+
+    def oidc_token_url(self) -> str:
+        """OAuth2 token endpoint used by the REST transport."""
+        return f"{self.workspace_url.rstrip('/')}/oidc/v1/token"
+
+    def transport_label(self) -> str:
+        """Short human label for the dashboard / logs."""
+        t = (self.transport or "grpc").lower()
+        if t == "grpc":
+            return f"gRPC ({(self.grpc_format or 'json').lower()})"
+        if t == "rest":
+            return "REST (Beta, JSON)"
+        if t == "arrow":
+            return "Arrow Flight (Beta)"
+        return t
 
 
 # (field, label, is_secret, is_required)
@@ -874,6 +905,10 @@ def render_dashboard(snap: dict, cfg: Config, target_eps: float) -> Panel:
         "Target:", f"{cfg.table_name}",
         "Endpoint:", cfg.zerobus_endpoint() if cfg.workspace_id else "(unset)",
     )
+    stats.add_row(
+        "Transport:", hi(cfg.transport_label()),
+        "", "",
+    )
     tl = snap.get("table_latency")
     if tl:
         avg = tl.get("avg_latency_sec")
@@ -1009,7 +1044,7 @@ def render_dashboard(snap: dict, cfg: Config, target_eps: float) -> Panel:
     return Panel(
         Group(*body),
         title="[bold cyan]Zerobus Feeder[/bold cyan]",
-        subtitle="[dim]Ctrl+C to stop[/dim]",
+        subtitle=f"[dim]{cfg.transport_label()} · Ctrl+C to stop[/dim]",
         border_style="cyan",
     )
 
@@ -1455,57 +1490,448 @@ def _query_table_latency(
         return None
 
 
+# ------------------------------------------------------------ Transports ----
+#
+# The feeder can reach Zerobus three ways. They share one tiny interface so the
+# run loop doesn't care which is in use:
+#
+#     sender.open()            establish the connection / fetch credentials
+#     sender.probe(record)     blocking, durable send — used to measure latency
+#     sender.push(record)      best-effort throughput send (non-blocking where
+#                              the transport allows it)
+#     sender.flush()           ensure buffered records are sent
+#     sender.close()           release resources
+#
+# probe()/push() take a generated record dict and return the number of payload
+# bytes actually put on the wire (so the dashboard's byte counter reflects each
+# transport's real serialization, not a normalized estimate).
+
+
+def _looks_like_auth_error(msg: str) -> bool:
+    msg = msg or ""
+    return (
+        "invalid_authorization_details" in msg
+        or "User is not authorized" in msg
+        or "PERMISSION_DENIED" in msg
+        or "permission" in msg.lower()
+        or "401" in msg
+        or "403" in msg
+    )
+
+
+def _open_with_grant_retry(cfg: "Config", opener):
+    """Run `opener()`; if it fails with an authorization error, offer to apply
+    the missing Zerobus table grants and retry once. Mirrors the original
+    inline create_stream behaviour so every transport benefits from it."""
+    try:
+        return opener()
+    except Exception as e:
+        if _looks_like_auth_error(str(e)) and _fixup_missing_grants(cfg):
+            say("[cyan]Retrying after applying grants...[/cyan]")
+            time.sleep(2)  # brief pause for grant propagation
+            return opener()
+        raise
+
+
+# ---- Protobuf: build a message class from the data-structure JSON ----------
+
+# Delta column type -> protobuf field type. Matches the Delta→Protobuf mapping
+# Zerobus documents (TIMESTAMP→int64 epoch micros, DATE→int32 epoch days).
+def _proto_type_map():
+    from google.protobuf.descriptor_pb2 import FieldDescriptorProto as F
+    return {
+        "string": F.TYPE_STRING, "int": F.TYPE_INT32, "long": F.TYPE_INT64,
+        "float": F.TYPE_FLOAT, "double": F.TYPE_DOUBLE, "boolean": F.TYPE_BOOL,
+        "timestamp": F.TYPE_INT64, "date": F.TYPE_INT32, "binary": F.TYPE_BYTES,
+    }
+
+
+def build_proto_message_class(columns, message_name: str = "FeederRecord"):
+    """Compile a protobuf message class from the feeder's column list at
+    runtime — no .proto file or protoc step. Field numbers are assigned in
+    column order; names and types mirror the target Delta table."""
+    from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
+
+    F = descriptor_pb2.FieldDescriptorProto
+    type_map = _proto_type_map()
+    fdp = descriptor_pb2.FileDescriptorProto(
+        name="zerobus_feeder_record.proto", syntax="proto3", package="feeder",
+    )
+    msg = fdp.message_type.add()
+    msg.name = message_name
+    for i, col in enumerate(columns, start=1):
+        t = col["type"].lower()
+        if t not in type_map:
+            raise ValueError(f"protobuf: unsupported column type {t!r}")
+        f = msg.field.add()
+        f.name = col["name"]
+        f.number = i
+        f.type = type_map[t]
+        f.label = F.LABEL_OPTIONAL
+    # A fresh pool avoids clashing with any other descriptors in the process.
+    pool = descriptor_pool.DescriptorPool()
+    pool.Add(fdp)
+    desc = pool.FindMessageTypeByName(f"feeder.{message_name}")
+    return message_factory.GetMessageClass(desc)
+
+
+def _proto_kwargs(record: dict, columns) -> dict:
+    """Turn a generated JSON record into protobuf constructor kwargs. None
+    (nullable) fields are skipped — proto3 has no null, so they take the type
+    default. Binary columns are base64-decoded back to raw bytes."""
+    kwargs = {}
+    for col in columns:
+        v = record.get(col["name"])
+        if v is None:
+            continue
+        if col["type"].lower() == "binary":
+            v = base64.b64decode(v)
+        kwargs[col["name"]] = v
+    return kwargs
+
+
+# ---- Arrow: build a pyarrow schema + one-row RecordBatch -------------------
+
+def build_arrow_schema(columns):
+    import pyarrow as pa
+    type_map = {
+        "string": pa.large_utf8(), "int": pa.int32(), "long": pa.int64(),
+        "float": pa.float32(), "double": pa.float64(), "boolean": pa.bool_(),
+        "timestamp": pa.timestamp("us", tz="UTC"), "date": pa.date32(),
+        "binary": pa.large_binary(),
+    }
+    fields = []
+    for col in columns:
+        t = col["type"].lower()
+        if t not in type_map:
+            raise ValueError(f"arrow: unsupported column type {t!r}")
+        fields.append((col["name"], type_map[t]))
+    return pa.schema(fields)
+
+
+def record_to_arrow_batch(record: dict, schema, columns):
+    import pyarrow as pa
+    arrays = []
+    for col in columns:
+        v = record.get(col["name"])
+        if col["type"].lower() == "binary" and v is not None:
+            v = base64.b64decode(v)
+        arrays.append(pa.array([v], type=schema.field(col["name"]).type))
+    return pa.record_batch(arrays, schema=schema)
+
+
+# ---- Senders ----------------------------------------------------------------
+
+class GrpcSender:
+    """Streaming gRPC via databricks-zerobus-ingest-sdk. JSON or Protobuf."""
+
+    def __init__(self, cfg: "Config", generator: "DataGenerator"):
+        self.cfg = cfg
+        self.generator = generator
+        self.fmt = (cfg.grpc_format or "json").lower()
+        self._stream = None
+        self._proto_cls = None
+
+    def open(self) -> None:
+        from zerobus.sdk.shared import (RecordType, StreamConfigurationOptions,
+                                         TableProperties)
+        from zerobus.sdk.sync import ZerobusSdk
+
+        sdk = ZerobusSdk(self.cfg.zerobus_endpoint(), self.cfg.workspace_url)
+        if self.fmt == "protobuf":
+            self._proto_cls = build_proto_message_class(self.generator.columns)
+            options = StreamConfigurationOptions(record_type=RecordType.PROTO)
+            table_props = TableProperties(self.cfg.table_name,
+                                          self._proto_cls.DESCRIPTOR)
+            logger.info("gRPC protobuf descriptor built (%d fields)",
+                        len(self.generator.columns))
+        else:
+            options = StreamConfigurationOptions(record_type=RecordType.JSON)
+            table_props = TableProperties(self.cfg.table_name)
+        self._stream = _open_with_grant_retry(
+            self.cfg,
+            lambda: sdk.create_stream(self.cfg.client_id, self.cfg.client_secret,
+                                      table_props, options),
+        )
+
+    def _payload(self, record: dict):
+        if self.fmt == "protobuf":
+            data = self._proto_cls(**_proto_kwargs(record, self.generator.columns)
+                                   ).SerializeToString()
+            return data, len(data)
+        s = json.dumps(record)
+        return s, len(s.encode("utf-8"))
+
+    def probe(self, record: dict) -> int:
+        payload, n = self._payload(record)
+        offset = self._stream.ingest_record_offset(payload)
+        self._stream.wait_for_offset(offset)
+        return n
+
+    def push(self, record: dict) -> int:
+        payload, n = self._payload(record)
+        self._stream.ingest_record_nowait(payload)
+        return n
+
+    def flush(self) -> None:
+        if self._stream:
+            self._stream.flush()
+
+    def close(self) -> None:
+        if self._stream:
+            self._stream.close()
+
+
+class ArrowSender:
+    """Arrow Flight via the SDK (Beta). Sends one-row pyarrow RecordBatches."""
+
+    def __init__(self, cfg: "Config", generator: "DataGenerator"):
+        self.cfg = cfg
+        self.generator = generator
+        self._stream = None
+        self._schema = None
+
+    def open(self) -> None:
+        try:
+            import pyarrow  # noqa: F401
+        except ImportError:
+            say("[red]Arrow transport needs pyarrow. Install:[/red]\n"
+                "[red]  pip install 'databricks-zerobus-ingest-sdk[arrow]'[/red]",
+                level=logging.ERROR)
+            raise SystemExit(1)
+        from zerobus.sdk.sync import ZerobusSdk
+
+        sdk = ZerobusSdk(self.cfg.zerobus_endpoint(), self.cfg.workspace_url)
+        if not hasattr(sdk, "create_arrow_stream"):
+            say("[red]Arrow Flight needs databricks-zerobus-ingest-sdk>=1.3.0.[/red]\n"
+                "[red]Upgrade:  pip install -U 'databricks-zerobus-ingest-sdk[arrow]'[/red]",
+                level=logging.ERROR)
+            raise SystemExit(1)
+        self._schema = build_arrow_schema(self.generator.columns)
+        logger.info("arrow schema: %s", self._schema)
+        self._stream = _open_with_grant_retry(
+            self.cfg,
+            lambda: sdk.create_arrow_stream(
+                self.cfg.table_name, self._schema,
+                self.cfg.client_id, self.cfg.client_secret),
+        )
+
+    def _batch(self, record: dict):
+        batch = record_to_arrow_batch(record, self._schema, self.generator.columns)
+        return batch, batch.nbytes
+
+    def probe(self, record: dict) -> int:
+        batch, n = self._batch(record)
+        offset = self._stream.ingest_batch(batch)
+        self._stream.wait_for_offset(offset)
+        return n
+
+    def push(self, record: dict) -> int:
+        batch, n = self._batch(record)
+        self._stream.ingest_batch(batch)
+        return n
+
+    def flush(self) -> None:
+        if self._stream:
+            self._stream.flush()
+
+    def close(self) -> None:
+        if self._stream:
+            self._stream.close()
+
+
+class RestSender:
+    """Zerobus REST API (Beta). Each send is a synchronous HTTPS POST of a
+    one-element JSON array; the 200 response is the durable-write ack, so probe
+    and push are the same round-trip (REST has no fire-and-forget path)."""
+
+    def __init__(self, cfg: "Config", generator: "DataGenerator"):
+        self.cfg = cfg
+        self.generator = generator
+        self._session = None
+        self._token = ""
+        self._token_expiry = 0.0
+        self._grants_fixed = False
+
+    def open(self) -> None:
+        try:
+            import requests
+        except ImportError:
+            say("[red]REST transport needs the 'requests' package.[/red]\n"
+                "[red]  pip install requests[/red]", level=logging.ERROR)
+            raise SystemExit(1)
+        self._session = requests.Session()
+        # The Zerobus token endpoint embeds the SP's table grants as OAuth
+        # authorization_details. Missing grants fail here with HTTP 400
+        # invalid_authorization_details — the same condition the gRPC path
+        # fixes at create_stream, so reuse the same grant-fixup-and-retry.
+        self._grants_fixed = True  # open() handles grants; don't re-prompt in _post
+        _open_with_grant_retry(self.cfg, self._fetch_token)
+        logger.info("REST transport ready: %s", self.cfg.rest_insert_url())
+
+    def _authorization_details(self) -> str:
+        """RFC 9396 rich-authorization-request payload naming the exact Unity
+        Catalog privileges the token must carry. Without this the Zerobus token
+        endpoint mints a token with no authorization-details claims and the
+        insert is rejected ("Missing authorization details in access token
+        claims")."""
+        catalog, schema, _ = _split_table_name(self.cfg.table_name)
+        return json.dumps([
+            {"type": "unity_catalog_privileges", "privileges": ["USE CATALOG"],
+             "object_type": "CATALOG", "object_full_path": catalog},
+            {"type": "unity_catalog_privileges", "privileges": ["USE SCHEMA"],
+             "object_type": "SCHEMA", "object_full_path": f"{catalog}.{schema}"},
+            {"type": "unity_catalog_privileges", "privileges": ["SELECT", "MODIFY"],
+             "object_type": "TABLE", "object_full_path": self.cfg.table_name},
+        ])
+
+    def _fetch_token(self) -> None:
+        resource = (f"api://databricks/workspaces/"
+                    f"{self.cfg.workspace_id}/zerobusDirectWriteApi")
+        url = self.cfg.oidc_token_url()
+        logger.info("REST OAuth token request: url=%s resource=%s client_id=%s",
+                    url, resource, self.cfg.client_id)
+        resp = self._session.post(
+            url,
+            auth=(self.cfg.client_id, self.cfg.client_secret),
+            data={
+                "grant_type": "client_credentials",
+                "scope": "all-apis",
+                "resource": resource,
+                # requests form-encodes this value, matching curl's
+                # --data-urlencode "authorization_details=...".
+                "authorization_details": self._authorization_details(),
+            },
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            # Surface the server's OAuth error body (error / error_description)
+            # — a bare "400 Bad Request" hides the actual reason.
+            logger.error("token endpoint HTTP %s  body=%s",
+                         resp.status_code, resp.text[:500])
+            raise RuntimeError(
+                f"OAuth token request to {url} failed: "
+                f"HTTP {resp.status_code} — {resp.text[:300]}\n"
+                f"(resource={resource})")
+        body = resp.json()
+        self._token = body["access_token"]
+        # Refresh a minute before the hour-long token actually expires.
+        self._token_expiry = time.time() + float(body.get("expires_in", 3600)) - 60
+        logger.info("REST OAuth token fetched (expires_in=%s)", body.get("expires_in"))
+
+    def _ensure_token(self) -> None:
+        if not self._token or time.time() >= self._token_expiry:
+            self._fetch_token()
+
+    def _post(self, record: dict) -> int:
+        self._ensure_token()
+        body = json.dumps([record])
+        url = self.cfg.rest_insert_url()
+        headers = {"Authorization": f"Bearer {self._token}",
+                   "Content-Type": "application/json"}
+        resp = self._session.post(url, data=body, headers=headers, timeout=30)
+        if resp.status_code == 401:
+            # Token may have expired between checks — refresh once and retry.
+            self._fetch_token()
+            headers["Authorization"] = f"Bearer {self._token}"
+            resp = self._session.post(url, data=body, headers=headers, timeout=30)
+        if resp.status_code == 403 and not self._grants_fixed:
+            # Missing table grants — offer the same fixup the gRPC path uses.
+            self._grants_fixed = True
+            if _fixup_missing_grants(self.cfg):
+                say("[cyan]Retrying REST insert after applying grants...[/cyan]")
+                time.sleep(2)
+                resp = self._session.post(url, data=body, headers=headers, timeout=30)
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"HTTP {resp.status_code}: {resp.text[:200]}")
+        return len(body.encode("utf-8"))
+
+    # POST is synchronous and durable, so probe and push are identical.
+    def probe(self, record: dict) -> int:
+        return self._post(record)
+
+    def push(self, record: dict) -> int:
+        return self._post(record)
+
+    def flush(self) -> None:
+        pass
+
+    def close(self) -> None:
+        if self._session:
+            self._session.close()
+
+
+def make_sender(cfg: "Config", generator: "DataGenerator"):
+    t = (cfg.transport or "grpc").lower()
+    if t == "grpc":
+        return GrpcSender(cfg, generator)
+    if t == "rest":
+        return RestSender(cfg, generator)
+    if t == "arrow":
+        return ArrowSender(cfg, generator)
+    raise ValueError(f"Unsupported transport: {cfg.transport!r} "
+                     f"(choose from {', '.join(TRANSPORTS)})")
+
+
 # --------------------------------------------------------------- Feeder ----
 
 def run_feeder(cfg: Config) -> None:
     # Silence the Rust SDK's tracing_subscriber so it doesn't scribble on
     # stderr inside the Rich Live dashboard. Must be set before SDK import.
     os.environ.setdefault("RUST_LOG", "error")
-    try:
-        from zerobus.sdk.shared import RecordType, StreamConfigurationOptions, TableProperties
-        from zerobus.sdk.sync import ZerobusSdk
-    except ImportError:
-        say("[red]databricks-zerobus-ingest-sdk is required.[/red]", level=logging.ERROR)
-        say("[red]Install: pip install databricks-zerobus-ingest-sdk[/red]", level=logging.ERROR)
-        sys.exit(1)
+    # Normalise + validate the transport selection (YAML / last-values can carry
+    # arbitrary strings; argparse already constrains CLI input).
+    cfg.transport = (cfg.transport or "grpc").lower()
+    cfg.grpc_format = (cfg.grpc_format or "json").lower()
+    if cfg.transport not in TRANSPORTS:
+        say(f"[red]Unknown transport {cfg.transport!r}; choose from "
+            f"{', '.join(TRANSPORTS)}.[/red]", level=logging.ERROR)
+        sys.exit(2)
+    if cfg.grpc_format not in GRPC_FORMATS:
+        say(f"[red]Unknown record format {cfg.grpc_format!r}; choose from "
+            f"{', '.join(GRPC_FORMATS)}.[/red]", level=logging.ERROR)
+        sys.exit(2)
+    if cfg.transport != "grpc" and cfg.grpc_format != "json":
+        say(f"[dim]Note: record format '{cfg.grpc_format}' applies only to the "
+            f"gRPC transport; '{cfg.transport}' ignores it.[/dim]")
+
+    # gRPC and Arrow need the SDK; REST does not. Only the gRPC/Arrow senders
+    # import zerobus internally, so check up front for a friendlier message.
+    if (cfg.transport or "grpc").lower() in ("grpc", "arrow"):
+        try:
+            import zerobus  # noqa: F401
+        except ImportError:
+            say("[red]databricks-zerobus-ingest-sdk is required for the "
+                f"'{cfg.transport}' transport.[/red]", level=logging.ERROR)
+            say("[red]Install: pip install databricks-zerobus-ingest-sdk[/red]",
+                level=logging.ERROR)
+            sys.exit(1)
 
     generator = DataGenerator(cfg.schema_file)
     endpoint = cfg.zerobus_endpoint()
-    logger.info("feeder starting  endpoint=%s  workspace_url=%s  table=%s  target_eps=%.3f  columns=%d",
-                endpoint, cfg.workspace_url, cfg.table_name, cfg.eps, len(generator.columns))
+    logger.info("feeder starting  transport=%s  endpoint=%s  workspace_url=%s  table=%s  "
+                "target_eps=%.3f  columns=%d",
+                cfg.transport_label(), endpoint, cfg.workspace_url, cfg.table_name,
+                cfg.eps, len(generator.columns))
 
+    say(f"[cyan]Transport[/cyan] {cfg.transport_label()}")
     say(f"[cyan]Connecting[/cyan] endpoint={endpoint}")
     say(f"[cyan]Workspace URL[/cyan] {cfg.workspace_url}")
     say(f"[cyan]Table[/cyan] {cfg.table_name}")
     say(f"[cyan]Authenticating[/cyan] as client_id={cfg.client_id}")
 
-    sdk = ZerobusSdk(endpoint, cfg.workspace_url)
-    options = StreamConfigurationOptions(record_type=RecordType.JSON)
-    table_props = TableProperties(cfg.table_name)
-
+    sender = make_sender(cfg, generator)
     try:
-        stream = sdk.create_stream(cfg.client_id, cfg.client_secret, table_props, options)
+        sender.open()
+    except SystemExit:
+        raise
     except Exception as e:
-        msg = str(e)
-        auth_err = (
-            "invalid_authorization_details" in msg
-            or "User is not authorized" in msg
-            or "401" in msg
-        )
-        if auth_err and _fixup_missing_grants(cfg):
-            say("[cyan]Retrying stream open after applying grants...[/cyan]")
-            time.sleep(2)  # brief pause for grant propagation
-            try:
-                stream = sdk.create_stream(cfg.client_id, cfg.client_secret, table_props, options)
-            except Exception as e2:
-                logger.exception("create_stream failed after grants")
-                say(f"[red]Still failed after applying grants: {e2}[/red]", level=logging.ERROR)
-                sys.exit(1)
-        else:
-            logger.exception("create_stream failed")
-            say(f"[red]Failed to open Zerobus stream: {e}[/red]", level=logging.ERROR)
-            sys.exit(1)
-    say("[green]✓[/green] Stream opened. Starting ingestion...")
+        logger.exception("sender.open failed")
+        say(f"[red]Failed to open {cfg.transport_label()} connection: {e}[/red]",
+            level=logging.ERROR)
+        sys.exit(1)
+    say("[green]✓[/green] Connection opened. Starting ingestion...")
 
     # Optional: SQL Statement client for the periodic table-latency query.
     # Runs after each probe batch, before resuming non-blocking sends.
@@ -1579,11 +2005,9 @@ def run_feeder(cfg: Config) -> None:
                         if stop.is_set():
                             break
                         record = generator.generate()
-                        payload = json.dumps(record)
                         t0 = time.perf_counter()
                         try:
-                            offset = stream.ingest_record_offset(payload)
-                            stream.wait_for_offset(offset)
+                            sender.probe(record)
                             latencies.append((time.perf_counter() - t0) * 1000.0)
                         except Exception as e:
                             msg = str(e)[:200]
@@ -1636,10 +2060,9 @@ def run_feeder(cfg: Config) -> None:
                     continue
 
                 record = generator.generate()
-                payload = json.dumps(record)
                 try:
-                    stream.ingest_record_nowait(payload)
-                    stats.record_sent(len(payload.encode("utf-8")))
+                    n = sender.push(record)
+                    stats.record_sent(n)
                 except Exception as e:
                     msg = str(e)[:200]
                     stats.record_error(msg)
@@ -1671,16 +2094,16 @@ def run_feeder(cfg: Config) -> None:
         logger.exception("feeder loop crashed")
         raise
     finally:
-        say("\n[cyan]Flushing and closing stream...[/cyan]")
+        say("\n[cyan]Flushing and closing connection...[/cyan]")
         try:
-            stream.flush()
-            logger.info("stream flushed")
+            sender.flush()
+            logger.info("sender flushed")
         except Exception as e:
             logger.warning("flush failed: %s", e)
             say(f"[yellow]flush: {e}[/yellow]", level=logging.WARNING)
         try:
-            stream.close()
-            logger.info("stream closed")
+            sender.close()
+            logger.info("sender closed")
         except Exception as e:
             logger.warning("close failed: %s", e)
             say(f"[yellow]close: {e}[/yellow]", level=logging.WARNING)
@@ -1709,6 +2132,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--region", help="Region code (e.g. us-west-2, eastus)")
     p.add_argument("--cloud", choices=CLOUDS, help="Cloud provider")
     p.add_argument("--table-name", help="Full table name (catalog.schema.table)")
+    p.add_argument("--transport", choices=TRANSPORTS,
+                   help="How to reach Zerobus: grpc (SDK streaming, default), "
+                        "rest (REST API, Beta — JSON over HTTPS), or "
+                        "arrow (Arrow Flight, Beta — columnar RecordBatches)")
+    p.add_argument("--record-format", choices=GRPC_FORMATS, dest="grpc_format",
+                   help="Serialization for the gRPC transport: json (default) or "
+                        "protobuf. Ignored for rest (always JSON) and arrow.")
     p.add_argument("--client-id", help="Service Principal client ID")
     p.add_argument("--client-secret", help="Service Principal client secret")
     p.add_argument("--workspace-url", help="Workspace URL (e.g. https://dbc-xxx.cloud.databricks.com)")
@@ -1737,6 +2167,7 @@ def apply_args(cfg: Config, args: argparse.Namespace) -> None:
         "client_id": "client_id", "client_secret": "client_secret",
         "workspace_url": "workspace_url", "profile": "profile",
         "warehouse_id": "warehouse_id", "sp_display_name": "sp_display_name",
+        "transport": "transport", "grpc_format": "grpc_format",
     }
     for arg_key, cfg_key in mapping.items():
         val = getattr(args, arg_key, None)
