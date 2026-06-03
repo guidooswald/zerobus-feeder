@@ -178,6 +178,13 @@ class Config:
             return "OTLP (Beta, spans/logs/metrics)"
         return t
 
+    def target_display(self) -> str:
+        """What the dashboard shows as the write target. For OTLP this is the
+        three derived OTel tables, not the bare prefix in table_name."""
+        if (self.transport or "grpc").lower() == "otlp" and self.table_name:
+            return f"{self.table_name}_otel_{{spans,logs,metrics}}"
+        return self.table_name
+
 
 # (field, label, is_secret, is_required)
 PARAMS: list[tuple[str, str, bool, bool]] = [
@@ -904,7 +911,7 @@ def render_dashboard(snap: dict, cfg: Config, target_eps: float) -> Panel:
         "Last probe avg / max:", f"{hi(lavg)} / {hi(lmaxp)} ms",
     )
     stats.add_row(
-        "Target:", f"{cfg.table_name}",
+        "Target:", cfg.target_display(),
         "Endpoint:", cfg.zerobus_endpoint() if cfg.workspace_id else "(unset)",
     )
     stats.add_row(
@@ -2307,7 +2314,7 @@ def run_feeder(cfg: Config) -> None:
     say(f"[cyan]Transport[/cyan] {cfg.transport_label()}")
     say(f"[cyan]Connecting[/cyan] endpoint={endpoint}")
     say(f"[cyan]Workspace URL[/cyan] {cfg.workspace_url}")
-    say(f"[cyan]Table[/cyan] {cfg.table_name}")
+    say(f"[cyan]Table[/cyan] {cfg.target_display()}")
     say(f"[cyan]Authenticating[/cyan] as client_id={cfg.client_id}")
 
     # OTLP writes to three derived OTel tables; offer to create them if missing
