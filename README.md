@@ -196,6 +196,8 @@ Notes:
   - The data-structure JSON does **not** apply — OTLP data follows the fixed
     OTel v2 schema. `--create-table` creates the three predefined tables (with
     `CLUSTER BY (time, service_name)` and `otel.schemaVersion=v2`) and grants.
+    If you start an OTLP run and the tables don't exist yet, the feeder detects
+    that (when a `--profile` is set) and offers to create them on the spot.
   - Each signal table gets its own OAuth token (per-table `authorization_details`)
     and is addressed with the `x-databricks-zerobus-table-name` header.
   - Authentication is the same client-credentials flow as REST. The SQL

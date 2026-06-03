@@ -1334,6 +1334,44 @@ def create_otel_tables(cfg: Config) -> None:
             _apply_zerobus_grants(w, warehouse_id, table, cfg.client_id)
 
 
+def _ensure_otel_tables(cfg: Config) -> None:
+    """For OTLP: check the three OTel tables exist and offer to create the
+    missing ones before streaming. No-op (with a hint) when there's no profile
+    to check/create with, or in non-interactive mode."""
+    tables = otel_table_names(cfg.table_name)
+    if not cfg.profile:
+        say("[dim]Tip: set --profile (and --create-table) to auto-create the "
+            "OTel tables if they don't exist.[/dim]")
+        return
+    try:
+        w = _workspace_client(cfg)
+    except SystemExit:
+        return  # auth problem already reported; let open() surface the rest
+
+    missing = []
+    for table in tables.values():
+        if _table_exists(w, table) is False:
+            missing.append(table)
+        # None → couldn't check (e.g. permissions); don't block on it.
+    if not missing:
+        logger.info("OTel tables present: %s", list(tables.values()))
+        return
+
+    say("[yellow]These OTel tables don't exist yet:[/yellow]")
+    for t in missing:
+        say(f"  • {t}")
+    if not sys.stdin.isatty():
+        say("[yellow]Re-run with --create-table to create them. Continuing — "
+            "ingestion will fail until they exist.[/yellow]", level=logging.WARNING)
+        return
+    if Confirm.ask("Create the OTel tables now?", default=True):
+        create_otel_tables(cfg)
+        save_last_values(cfg)
+    else:
+        say("[yellow]Skipping table creation — ingestion will fail until the "
+            "tables exist.[/yellow]", level=logging.WARNING)
+
+
 def _split_table_name(table_name: str) -> tuple[str, str, str]:
     parts = table_name.split(".")
     if len(parts) != 3:
@@ -1370,6 +1408,22 @@ def _schema_exists(w, catalog: str, schema: str) -> Optional[bool]:
         return False
     except Exception as e:
         logger.debug("schemas.get(%s.%s) failed: %s", catalog, schema, e)
+        return None
+
+
+def _table_exists(w, table_name: str) -> Optional[bool]:
+    """True if the table exists, False if not, None if the check itself failed."""
+    try:
+        from databricks.sdk.errors import NotFound
+    except Exception:
+        NotFound = ()  # type: ignore
+    try:
+        w.tables.get(table_name)
+        return True
+    except NotFound:  # type: ignore[misc]
+        return False
+    except Exception as e:
+        logger.debug("tables.get(%s) failed: %s", table_name, e)
         return None
 
 
@@ -2251,6 +2305,11 @@ def run_feeder(cfg: Config) -> None:
     say(f"[cyan]Workspace URL[/cyan] {cfg.workspace_url}")
     say(f"[cyan]Table[/cyan] {cfg.table_name}")
     say(f"[cyan]Authenticating[/cyan] as client_id={cfg.client_id}")
+
+    # OTLP writes to three derived OTel tables; offer to create them if missing
+    # before we try to open the connection.
+    if cfg.transport == "otlp":
+        _ensure_otel_tables(cfg)
 
     sender = make_sender(cfg, generator)
     try:
