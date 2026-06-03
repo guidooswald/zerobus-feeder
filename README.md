@@ -201,7 +201,8 @@ Notes:
   - Each signal table gets its own OAuth token (per-table `authorization_details`)
     and is addressed with the `x-databricks-zerobus-table-name` header.
   - Authentication is the same client-credentials flow as REST. The SQL
-    table-latency panel is auto-disabled (the OTel schema has no `event_time`).
+    table-latency panel reads the spans table (`<prefix>_otel_spans`) using its
+    `time` column instead of `event_time`, so end-to-end latency still shows.
   - Like REST, each export is a synchronous round-trip, so high `--eps` targets
     are round-trip-bound. For production OpenTelemetry you'd typically point an
     [OpenTelemetry Collector](https://docs.databricks.com/aws/en/ingestion/opentelemetry/configure)

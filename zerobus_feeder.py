@@ -1570,30 +1570,34 @@ def _execute_sql(w, warehouse_id: str, sql: str) -> None:
 
 
 # Latency in seconds with microsecond precision, rounded to 2 decimals
-# (10ms granularity). The window length is plugged in at format time.
+# (10ms granularity). The window length and event-time column are plugged in at
+# format time — the OTel tables timestamp their rows in `time`, the feeder's own
+# schema uses `event_time`.
 _TABLE_LATENCY_SQL = """
 SELECT
   count(*)                                                                                                                      AS total_rows,
-  min(event_time)                                                                                                               AS earliest_event,
-  max(event_time)                                                                                                               AS latest_event,
-  round(avg              ((unix_micros(_metadata.file_modification_time) - unix_micros(event_time)) / 1000000.0     ), 2)       AS avg_latency_sec,
-  round(min              ((unix_micros(_metadata.file_modification_time) - unix_micros(event_time)) / 1000000.0     ), 2)       AS min_latency_sec,
-  round(max              ((unix_micros(_metadata.file_modification_time) - unix_micros(event_time)) / 1000000.0     ), 2)       AS max_latency_sec,
-  round(percentile_approx((unix_micros(_metadata.file_modification_time) - unix_micros(event_time)) / 1000000.0, 0.5 ), 2)      AS p50_latency_sec,
-  round(percentile_approx((unix_micros(_metadata.file_modification_time) - unix_micros(event_time)) / 1000000.0, 0.95), 2)      AS p95_latency_sec,
-  round(percentile_approx((unix_micros(_metadata.file_modification_time) - unix_micros(event_time)) / 1000000.0, 0.99), 2)      AS p99_latency_sec
+  min({time_col})                                                                                                               AS earliest_event,
+  max({time_col})                                                                                                               AS latest_event,
+  round(avg              ((unix_micros(_metadata.file_modification_time) - unix_micros({time_col})) / 1000000.0     ), 2)       AS avg_latency_sec,
+  round(min              ((unix_micros(_metadata.file_modification_time) - unix_micros({time_col})) / 1000000.0     ), 2)       AS min_latency_sec,
+  round(max              ((unix_micros(_metadata.file_modification_time) - unix_micros({time_col})) / 1000000.0     ), 2)       AS max_latency_sec,
+  round(percentile_approx((unix_micros(_metadata.file_modification_time) - unix_micros({time_col})) / 1000000.0, 0.5 ), 2)      AS p50_latency_sec,
+  round(percentile_approx((unix_micros(_metadata.file_modification_time) - unix_micros({time_col})) / 1000000.0, 0.95), 2)      AS p95_latency_sec,
+  round(percentile_approx((unix_micros(_metadata.file_modification_time) - unix_micros({time_col})) / 1000000.0, 0.99), 2)      AS p99_latency_sec
 FROM {table}
-WHERE event_time >= current_timestamp() - INTERVAL {window_seconds} SECONDS
+WHERE {time_col} >= current_timestamp() - INTERVAL {window_seconds} SECONDS
 """.strip()
 
 
 def _query_table_latency(
     w, warehouse_id: str, table_name: str, window_seconds: int,
+    time_column: str = "event_time",
 ) -> Optional[dict]:
     """Run the ingest-latency query against the target table.
 
     `window_seconds` is the WHERE-clause lookback (e.g. 30 for the graph,
-    900 for the summary).
+    900 for the summary). `time_column` is the row event-time column —
+    "event_time" for the feeder's own schema, "time" for the OTel tables.
 
     Returns a dict of named values, or None if the query failed/timed out.
     Bounded by a 15s warehouse-side timeout so we never block streaming.
@@ -1602,7 +1606,7 @@ def _query_table_latency(
         ExecuteStatementRequestOnWaitTimeout, StatementState,
     )
     sql = _TABLE_LATENCY_SQL.format(
-        table=table_name, window_seconds=int(window_seconds),
+        table=table_name, window_seconds=int(window_seconds), time_col=time_column,
     )
     try:
         resp = w.statement_execution.execute_statement(
@@ -2326,11 +2330,17 @@ def run_feeder(cfg: Config) -> None:
     # Optional: SQL Statement client for the periodic table-latency query.
     # Runs after each probe batch, before resuming non-blocking sends.
     tl_client = None
+    # Which table/column the ingest-latency query reads. OTLP rows land in the
+    # spans table and are timestamped in `time`; everything else uses the
+    # feeder's own table + `event_time` column.
     if cfg.transport == "otlp":
-        # OTLP writes to fixed-schema OTel tables (time/service_name, no
-        # event_time) under a prefix, so the ingest-latency query can't run.
-        say("[dim]Table-latency query disabled (OTLP uses the OTel schema).[/dim]")
-    elif cfg.disable_table_latency:
+        latency_table = otel_table_names(cfg.table_name)["spans"]
+        latency_time_col = "time"
+    else:
+        latency_table = cfg.table_name
+        latency_time_col = "event_time"
+
+    if cfg.disable_table_latency:
         say("[dim]Table-latency query disabled (--no-table-latency).[/dim]")
     else:
         if cfg.profile:
@@ -2350,6 +2360,8 @@ def run_feeder(cfg: Config) -> None:
         if tl_client is None or not cfg.warehouse_id:
             say("[dim]Table-latency query disabled (no warehouse configured).[/dim]")
             tl_client = None
+        elif cfg.transport == "otlp":
+            say(f"[dim]Table-latency reads {latency_table} (time column).[/dim]")
 
     stats = Stats()
     # Cycle: non-blocking push → probe → table-latency → repeat. Start in
@@ -2424,8 +2436,8 @@ def run_feeder(cfg: Config) -> None:
                             ("15m",  15 * 60,  stats.record_table_latency_summary),
                         ):
                             res = _query_table_latency(
-                                tl_client, cfg.warehouse_id, cfg.table_name,
-                                window_seconds=window_s,
+                                tl_client, cfg.warehouse_id, latency_table,
+                                window_seconds=window_s, time_column=latency_time_col,
                             )
                             if res:
                                 recorder(res)
