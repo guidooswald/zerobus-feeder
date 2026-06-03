@@ -1761,22 +1761,58 @@ class RestSender:
                 "[red]  pip install requests[/red]", level=logging.ERROR)
             raise SystemExit(1)
         self._session = requests.Session()
-        self._fetch_token()
+        # The Zerobus token endpoint embeds the SP's table grants as OAuth
+        # authorization_details. Missing grants fail here with HTTP 400
+        # invalid_authorization_details — the same condition the gRPC path
+        # fixes at create_stream, so reuse the same grant-fixup-and-retry.
+        self._grants_fixed = True  # open() handles grants; don't re-prompt in _post
+        _open_with_grant_retry(self.cfg, self._fetch_token)
         logger.info("REST transport ready: %s", self.cfg.rest_insert_url())
 
+    def _authorization_details(self) -> str:
+        """RFC 9396 rich-authorization-request payload naming the exact Unity
+        Catalog privileges the token must carry. Without this the Zerobus token
+        endpoint mints a token with no authorization-details claims and the
+        insert is rejected ("Missing authorization details in access token
+        claims")."""
+        catalog, schema, _ = _split_table_name(self.cfg.table_name)
+        return json.dumps([
+            {"type": "unity_catalog_privileges", "privileges": ["USE CATALOG"],
+             "object_type": "CATALOG", "object_full_path": catalog},
+            {"type": "unity_catalog_privileges", "privileges": ["USE SCHEMA"],
+             "object_type": "SCHEMA", "object_full_path": f"{catalog}.{schema}"},
+            {"type": "unity_catalog_privileges", "privileges": ["SELECT", "MODIFY"],
+             "object_type": "TABLE", "object_full_path": self.cfg.table_name},
+        ])
+
     def _fetch_token(self) -> None:
+        resource = (f"api://databricks/workspaces/"
+                    f"{self.cfg.workspace_id}/zerobusDirectWriteApi")
+        url = self.cfg.oidc_token_url()
+        logger.info("REST OAuth token request: url=%s resource=%s client_id=%s",
+                    url, resource, self.cfg.client_id)
         resp = self._session.post(
-            self.cfg.oidc_token_url(),
+            url,
             auth=(self.cfg.client_id, self.cfg.client_secret),
             data={
                 "grant_type": "client_credentials",
                 "scope": "all-apis",
-                "resource": (f"api://databricks/workspaces/"
-                             f"{self.cfg.workspace_id}/zerobusDirectWriteApi"),
+                "resource": resource,
+                # requests form-encodes this value, matching curl's
+                # --data-urlencode "authorization_details=...".
+                "authorization_details": self._authorization_details(),
             },
             timeout=30,
         )
-        resp.raise_for_status()
+        if resp.status_code != 200:
+            # Surface the server's OAuth error body (error / error_description)
+            # — a bare "400 Bad Request" hides the actual reason.
+            logger.error("token endpoint HTTP %s  body=%s",
+                         resp.status_code, resp.text[:500])
+            raise RuntimeError(
+                f"OAuth token request to {url} failed: "
+                f"HTTP {resp.status_code} — {resp.text[:300]}\n"
+                f"(resource={resource})")
         body = resp.json()
         self._token = body["access_token"]
         # Refresh a minute before the hour-long token actually expires.
