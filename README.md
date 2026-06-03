@@ -17,8 +17,9 @@ Features:
   (plus OAuth secret and grants) via a Databricks CLI profile.
 - Live terminal dashboard with throughput, latency percentiles, and a sparkline
   of recent latencies.
-- OAuth2 client-credentials authentication via the Zerobus Python SDK — no PAT
-  on disk.
+- Selectable transport: streaming **gRPC** (JSON or Protobuf), the **REST** API
+  (Beta), or **Arrow Flight** (Beta) — see [Transports](#transports).
+- OAuth2 client-credentials authentication — no PAT on disk.
 
 ## Prerequisites
 
@@ -109,6 +110,10 @@ python zerobus_feeder.py [options]
   --region CODE             e.g. us-west-2, eastus
   --cloud {aws,azure,gcp}   Cloud provider
   --table-name NAME         Full table name (catalog.schema.table)
+  --transport {grpc,rest,arrow}
+                            How to reach Zerobus (default grpc). See Transports.
+  --record-format {json,protobuf}
+                            gRPC serialization (default json); ignored by rest/arrow
   --client-id ID            Service principal client ID
   --client-secret SECRET    Service principal client secret
   --workspace-url URL       https://<host>; auto-filled from CLI profile if set
@@ -135,6 +140,49 @@ is the sole source of configuration:
 ```bash
 python zerobus_feeder.py --config sample_config.yaml
 ```
+
+## Transports
+
+The feeder can reach Zerobus three different ways, selected with `--transport`
+(or `transport:` in YAML). The probe/latency cycle, dashboard, and table-latency
+query work identically across all three — only the wire path changes, which
+makes this useful for comparing them head-to-head.
+
+| Transport | Wire | Serialization | Status | Needs |
+|---|---|---|---|---|
+| `grpc` (default) | SDK streaming gRPC | JSON or Protobuf | GA | `databricks-zerobus-ingest-sdk` |
+| `rest` | HTTPS `POST` | JSON | Beta | `requests` (no SDK) |
+| `arrow` | Arrow Flight (gRPC) | Apache Arrow `RecordBatch` | Beta | `...-sdk[arrow]>=1.3.0` + `pyarrow` |
+
+```bash
+# gRPC with Protobuf (descriptor built from the schema at runtime)
+python zerobus_feeder.py --transport grpc --record-format protobuf
+
+# Zerobus REST API (no SDK needed)
+python zerobus_feeder.py --transport rest
+
+# Arrow Flight
+python zerobus_feeder.py --transport arrow
+```
+
+Notes:
+
+- **gRPC** is the original path. `--record-format protobuf` compiles a protobuf
+  message from `schema_file` in-process (no `.proto` file or `protoc` step) and
+  streams binary records; `json` (default) streams JSON.
+- **REST** authenticates with the OAuth2 client-credentials flow against
+  `<workspace_url>/oidc/v1/token` and `POST`s a one-element JSON array to
+  `https://<endpoint>/zerobus/v1/tables/<table>/insert`. Each `POST` is a
+  synchronous, durable write — there is no fire-and-forget path — so the
+  "streaming" phase is round-trip-bound and high `--eps` targets may not be
+  reached. That's an honest characteristic of the REST API, not a bug.
+- **Arrow** (Beta) sends one-row `pyarrow.RecordBatch` objects over Arrow Flight.
+  It requires `databricks-zerobus-ingest-sdk[arrow]>=1.3.0`; `pip install -r
+  requirements.txt` installs the right version. Delta `TIMESTAMP` maps to
+  `timestamp('us', tz='UTC')` and `DATE` to `date32`.
+
+Both Protobuf and Arrow derive their schema from the same data-structure JSON,
+so the target table must match it (use `--create-table` to keep them in sync).
 
 ## Data structure JSON
 
