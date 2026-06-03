@@ -146,7 +146,9 @@ python zerobus_feeder.py --config sample_config.yaml
 The feeder can reach Zerobus three different ways, selected with `--transport`
 (or `transport:` in YAML). The probe/latency cycle, dashboard, and table-latency
 query work identically across all three — only the wire path changes, which
-makes this useful for comparing them head-to-head.
+makes this useful for comparing them head-to-head. For Databricks' own
+guidance on picking an interface, see
+[Choose an interface](https://docs.databricks.com/aws/en/ingestion/zerobus-ingest#choose-an-interface).
 
 | Transport | Wire | Serialization | Status | Needs |
 |---|---|---|---|---|
