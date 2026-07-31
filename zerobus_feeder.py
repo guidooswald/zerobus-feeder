@@ -145,6 +145,16 @@ class Config:
     # arrow is always Arrow). "json" needs no schema; "protobuf" builds a
     # descriptor from the data-structure JSON at runtime.
     grpc_format: str = "json"
+    # Zerobus rescue column (Beta, JSON ingestion only). When set, --create-table
+    # adds a nullable VARIANT column with this name and applies the UC
+    # `zerobus-rescue` tag, so non-conforming fields are captured instead of
+    # rejected. See https://docs.databricks.com/aws/en/ingestion/zerobus-rescue-column
+    rescue_column: str = ""
+    # Percentage (0..100) of generated JSON records that get deliberately
+    # non-conforming fields injected (an extra field + a type-mismatched value)
+    # so the rescue column is exercised. 0 disables injection. Ignored by the
+    # protobuf/arrow/otlp paths (rescue is JSON-only).
+    rescue_inject_pct: float = 0.0
 
     def zerobus_endpoint(self) -> str:
         cloud = (self.cloud or "").lower()
@@ -482,7 +492,7 @@ def missing_required(cfg: Config) -> list[str]:
 # ----------------------------------------------------- Data generation ----
 
 class DataGenerator:
-    def __init__(self, schema_path: str):
+    def __init__(self, schema_path: str, rescue_inject_pct: float = 0.0):
         with open(schema_path) as f:
             self.schema = json.load(f)
         if "columns" not in self.schema or not isinstance(self.schema["columns"], list):
@@ -496,9 +506,38 @@ class DataGenerator:
                     f"Unsupported type {col['type']!r} in column {col['name']!r}. "
                     f"Supported: {sorted(SUPPORTED_TYPES)}"
                 )
+        # Fraction (0..1) of records that get deliberately non-conforming fields
+        # so a configured Zerobus rescue column gets populated. Clamped here.
+        self.rescue_inject_ratio = max(0.0, min(1.0, float(rescue_inject_pct) / 100.0))
 
     def generate(self) -> dict:
-        return {col["name"]: self._gen(col) for col in self.columns}
+        record = {col["name"]: self._gen(col) for col in self.columns}
+        if self.rescue_inject_ratio and random.random() < self.rescue_inject_ratio:
+            self._inject_nonconforming(record)
+        return record
+
+    def _inject_nonconforming(self, record: dict) -> None:
+        """Mutate ``record`` in place so it carries fields the target table
+        can't accept directly — an extra field that isn't in the schema, plus a
+        type-mismatched value on an existing nullable column. With a Zerobus
+        rescue column configured these land in the rescue VARIANT instead of
+        rejecting the record. Never touches the rescue column itself (it must
+        not appear in the payload)."""
+        # 1. An extra field that isn't part of the table schema at all.
+        record[f"rescue_extra_{random.randint(1000, 9999)}"] = random.choice([
+            "unexpected", random.randint(1, 999), {"nested": "value"},
+        ])
+        # 2. A type mismatch on an existing non-string column: put a string
+        #    where an INT/LONG/FLOAT/DOUBLE/BOOLEAN/TIMESTAMP/DATE is expected.
+        #    Zerobus rescues a mismatch only when the target column is nullable,
+        #    so prefer nullable, non-string columns.
+        candidates = [
+            c for c in self.columns
+            if c["type"].lower() != "string" and c.get("nullable")
+        ] or [c for c in self.columns if c["type"].lower() != "string"]
+        if candidates:
+            col = random.choice(candidates)
+            record[col["name"]] = f"not-a-{col['type'].lower()}"
 
     @staticmethod
     def _gen(col: dict) -> Any:
@@ -1226,22 +1265,37 @@ def create_table(cfg: Config) -> None:
     gen = DataGenerator(cfg.schema_file)  # validates schema early
     logger.info("schema loaded from %s with %d columns", cfg.schema_file, len(gen.columns))
 
+    # A rescue column must be a VARIANT and must not collide with a schema column.
+    rescue = (cfg.rescue_column or "").strip()
+    if rescue and any(c["name"] == rescue for c in gen.columns):
+        say(f"[red]--rescue-column {rescue!r} clashes with a column in the schema "
+            f"file. Choose a name that isn't already a data column.[/red]",
+            level=logging.ERROR)
+        sys.exit(2)
+
     warehouse_id = cfg.warehouse_id or _pick_warehouse(w)
     cfg.warehouse_id = warehouse_id
     logger.info("using warehouse_id=%s", warehouse_id)
 
     _ensure_catalog_and_schema(w, warehouse_id, cfg.table_name)
 
-    cols = ",\n  ".join(
+    col_defs = [
         f"{c['name']} {DELTA_TYPE_MAP[c['type'].lower()]}"
         for c in gen.columns
-    )
+    ]
+    if rescue:
+        # Nullable VARIANT; the `zerobus-rescue` UC tag is applied after CREATE.
+        col_defs.append(f"{rescue} VARIANT")
+    cols = ",\n  ".join(col_defs)
     ddl = f"CREATE TABLE IF NOT EXISTS {cfg.table_name} (\n  {cols}\n)"
     say("[cyan]Executing DDL:[/cyan]")
     console.print(Panel(ddl, border_style="dim"))
     logger.info("DDL:\n%s", ddl)
     _execute_sql(w, warehouse_id, ddl)
     say(f"[green]✓[/green] Table {cfg.table_name} ready.")
+
+    if rescue:
+        _apply_rescue_column_tag(w, warehouse_id, cfg.table_name, rescue)
 
     if cfg.client_id and Confirm.ask(
         f"Grant USE CATALOG / USE SCHEMA / MODIFY / SELECT to {cfg.client_id} on this table?",
@@ -1483,6 +1537,19 @@ def _apply_zerobus_grants(w, warehouse_id: str, table_name: str, principal: str)
     for sql in sqls:
         _execute_sql(w, warehouse_id, sql)
     say("[green]✓[/green] Grants applied.")
+
+
+def _apply_rescue_column_tag(w, warehouse_id: str, table_name: str, column: str) -> None:
+    """Tag ``column`` with the Unity Catalog `zerobus-rescue` tag so Zerobus
+    captures non-conforming fields there instead of rejecting the record. The
+    column must already exist as a nullable VARIANT. Tag changes can take up to
+    5 minutes to take effect (per the Zerobus docs)."""
+    sql = f"ALTER TABLE {table_name} ALTER COLUMN {column} SET TAGS ('zerobus-rescue')"
+    logger.info("rescue-column tag SQL: %s", sql)
+    _execute_sql(w, warehouse_id, sql)
+    say(f"[green]✓[/green] Rescue column [bold]{column}[/bold] tagged "
+        f"'zerobus-rescue' (VARIANT). Tag changes can take up to 5 minutes to "
+        f"take effect.")
 
 
 def _fixup_missing_grants(cfg: "Config", table_name: Optional[str] = None) -> bool:
@@ -2304,7 +2371,22 @@ def run_feeder(cfg: Config) -> None:
                 level=logging.ERROR)
             sys.exit(1)
 
-    generator = DataGenerator(cfg.schema_file)
+    # Rescue-column injection is JSON-only. Warn and disable it on wire paths
+    # that can't carry non-conforming fields (protobuf/arrow are schema-bound;
+    # otlp uses a fixed schema). REST and gRPC-JSON keep it.
+    inject_pct = float(cfg.rescue_inject_pct or 0.0)
+    json_capable = cfg.transport == "rest" or (
+        cfg.transport == "grpc" and cfg.grpc_format == "json")
+    if inject_pct and not json_capable:
+        say(f"[yellow]Rescue-column injection ({inject_pct:g}%) is JSON-only; "
+            f"the '{cfg.transport_label()}' path can't carry non-conforming "
+            f"fields — disabling it for this run.[/yellow]", level=logging.WARNING)
+        inject_pct = 0.0
+
+    generator = DataGenerator(cfg.schema_file, rescue_inject_pct=inject_pct)
+    if inject_pct:
+        say(f"[cyan]Rescue injection[/cyan] {inject_pct:g}% of records carry "
+            f"non-conforming fields")
     endpoint = cfg.zerobus_endpoint()
     logger.info("feeder starting  transport=%s  endpoint=%s  workspace_url=%s  table=%s  "
                 "target_eps=%.3f  columns=%d",
@@ -2567,6 +2649,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-table-latency", action="store_true",
                    help="Disable the periodic ingest-latency SQL query "
                         "(skips the SQL warehouse round-trip after each probe)")
+    p.add_argument("--rescue-column", metavar="NAME",
+                   help="Name of a Zerobus rescue column (Beta, JSON only). "
+                        "With --create-table, adds a nullable VARIANT column "
+                        "with this name and applies the UC 'zerobus-rescue' tag, "
+                        "so non-conforming fields are captured instead of rejected.")
+    p.add_argument("--rescue-inject-pct", type=float, metavar="PCT",
+                   help="Percentage (0-100) of generated JSON records that get "
+                        "deliberately non-conforming fields (an extra field plus "
+                        "a type-mismatched value) so the rescue column is "
+                        "exercised. Default 0 (off). JSON transports only.")
     mode = p.add_mutually_exclusive_group()
     mode.add_argument("--interactive", action="store_true",
                       help="Force interactive prompts for all parameters")
@@ -2583,6 +2675,7 @@ def apply_args(cfg: Config, args: argparse.Namespace) -> None:
         "workspace_url": "workspace_url", "profile": "profile",
         "warehouse_id": "warehouse_id", "sp_display_name": "sp_display_name",
         "transport": "transport", "grpc_format": "grpc_format",
+        "rescue_column": "rescue_column", "rescue_inject_pct": "rescue_inject_pct",
     }
     for arg_key, cfg_key in mapping.items():
         val = getattr(args, arg_key, None)

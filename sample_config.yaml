@@ -54,3 +54,17 @@ warehouse_id: ""
 
 # Optional: display name used when --create-sp creates a new service principal.
 sp_display_name: zerobus-feeder
+
+# Optional: Zerobus rescue column (Beta, JSON ingestion only). When set, --create-table
+# adds a nullable VARIANT column with this name and applies the Unity Catalog
+# 'zerobus-rescue' tag. Non-conforming fields (extra fields, or type-mismatched
+# values on nullable columns) are then captured in this column instead of the
+# whole record being rejected. Leave empty to disable.
+# See https://docs.databricks.com/aws/en/ingestion/zerobus-rescue-column
+rescue_column: ""
+
+# Optional: percentage (0-100) of generated JSON records that get deliberately
+# non-conforming fields injected (an extra field + a type-mismatched value) so
+# the rescue column is exercised. 0 disables injection. JSON transports only
+# (grpc+json and rest); ignored by protobuf/arrow/otlp.
+rescue_inject_pct: 0

@@ -124,6 +124,11 @@ python zerobus_feeder.py [options]
   --create-sp               Create an SP + OAuth secret (needs --profile)
   --create-table            Create the target table from the schema (needs --profile)
   --no-table-latency        Skip the periodic ingest-latency SQL query
+  --rescue-column NAME      Rescue column (Beta, JSON only). With --create-table,
+                            adds a nullable VARIANT column + the UC 'zerobus-rescue'
+                            tag. See Rescue column.
+  --rescue-inject-pct PCT   % of JSON records that get non-conforming fields
+                            injected so the rescue column is exercised (default 0)
   --interactive             Force prompts for every parameter
   --non-interactive         Never prompt; error on any missing required parameter
 ```
@@ -232,6 +237,45 @@ issued by `--create-table`.
 | `binary` | `BINARY` | `length` (base64-encoded in JSON) |
 
 Every column also accepts `nullable: true` + `null_probability: 0.0..1.0`.
+
+## Rescue column
+
+Zerobus can capture fields that don't match the target table's schema instead of
+rejecting the whole record. Non-conforming fields — an extra field not in the
+schema, or a type-mismatched value on a nullable column — are grouped into a
+JSON object and written to a designated **rescue column** (a nullable `VARIANT`
+tagged `zerobus-rescue` in Unity Catalog). See the Databricks docs:
+[Capture nonconformant fields with the Zerobus rescue column](https://docs.databricks.com/aws/en/ingestion/zerobus-rescue-column).
+The feature is **Beta** and supported **only for JSON ingestion** (the `grpc`
+transport with `--record-format json`, or the `rest` transport).
+
+Provision the column with `--rescue-column` on `--create-table`:
+
+```bash
+python zerobus_feeder.py \
+  --profile DEFAULT --create-table \
+  --schema-file sample_schema.json \
+  --table-name main.default.zerobus_feeder_events \
+  --rescue-column rescue
+```
+
+This appends `rescue VARIANT` to the generated `CREATE TABLE` and then runs
+`ALTER TABLE ... ALTER COLUMN rescue SET TAGS ('zerobus-rescue')`. Tag changes
+can take up to **5 minutes** to take effect. The name must not collide with a
+column already in the schema file.
+
+To see the column populated, inject non-conforming records with
+`--rescue-inject-pct` (0–100). Each injected record gets an extra field plus a
+type-mismatched value on a nullable, non-string column:
+
+```bash
+python zerobus_feeder.py --transport rest --rescue-inject-pct 25
+```
+
+Injection is JSON-only; on the `protobuf`, `arrow`, and `otlp` paths (which are
+schema-bound) it is warned about and disabled for the run. The rescue column
+itself is reserved — the feeder never puts it in the payload, and a record that
+supplies a non-null value for it is rejected by Zerobus.
 
 ## Creating the service principal and table
 
